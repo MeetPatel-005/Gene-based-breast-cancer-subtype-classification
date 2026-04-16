@@ -37,6 +37,7 @@ share/python-wheels/
 .installed.cfg
 *.egg
 MANIFEST
+tree.txt
 
 # Jupyter Notebook
 .ipynb_checkpoints/
@@ -61,3 +62,9 @@ Thumbs.db
 # OS
 .DS_Store
 Thumbs.db
+
+brca_webapp/data/examples
+brca_webapp/models
+brca_webapp/uploads
+.agents
+Webapp idea.md
