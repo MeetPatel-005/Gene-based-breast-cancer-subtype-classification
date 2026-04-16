@@ -1,0 +1,362 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+  <meta charset="UTF-8">
+  <meta name="viewport" content="width=device-width, initial-scale=1.0">
+  <title>BRCA Gene Expression Classifier | Subtype Prediction</title>
+  <meta name="description" content="AI-powered breast cancer subtype classification from gene expression (TPM) data using a stacking ensemble model trained on TCGA-BRCA.">
+
+  <link rel="preconnect" href="https://fonts.googleapis.com">
+  <link rel="preconnect" href="https://fonts.gstatic.com" crossorigin>
+  <link href="https://fonts.googleapis.com/css2?family=Inter:wght@300;400;500;600;700&family=Space+Grotesk:wght@400;500;600;700&display=swap" rel="stylesheet">
+  <link rel="stylesheet" href="{{ url_for('static', filename='style.css') }}">
+</head>
+<body>
+
+<!-- ── Animated background ── -->
+<canvas id="bgCanvas"></canvas>
+
+<!-- ── Navbar ── -->
+<nav class="navbar">
+  <div class="nav-brand">
+    <span class="nav-icon">🧬</span>
+    <span class="nav-title">BRCA<span class="nav-accent">Classifier</span></span>
+  </div>
+  <div class="nav-links">
+    <a href="#classify" class="nav-link">Classify</a>
+    <a href="#subtypes" class="nav-link">Subtypes</a>
+    <a href="#about" class="nav-link">About</a>
+  </div>
+</nav>
+
+<!-- ── Hero ── -->
+<section class="hero" id="home">
+  <div class="hero-content">
+    <div class="hero-badge">TCGA-BRCA &middot; Stacking Ensemble &middot; 5-Class</div>
+    <h1 class="hero-title">
+      Breast Cancer<br>
+      <span class="gradient-text">Subtype Classification</span>
+    </h1>
+    <p class="hero-subtitle">
+      Upload gene expression data in TPM format and get AI-powered classification into one of five molecular subtypes &mdash; with confidence scores, probability breakdown, and therapeutic guidance.
+    </p>
+    <a href="#classify" class="btn-hero">
+      <span>Start Classification</span>
+      <svg width="18" height="18" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2">
+        <path d="M5 12h14M12 5l7 7-7 7"/>
+      </svg>
+    </a>
+  </div>
+
+  <div class="hero-visual">
+    <div class="dna-helix">
+      <div class="helix-ring" style="--i:0"></div>
+      <div class="helix-ring" style="--i:1"></div>
+      <div class="helix-ring" style="--i:2"></div>
+      <div class="helix-ring" style="--i:3"></div>
+      <div class="helix-ring" style="--i:4"></div>
+      <div class="helix-ring" style="--i:5"></div>
+    </div>
+  </div>
+</section>
+
+<!-- ── Classify Section ── -->
+<section class="classify-section" id="classify">
+  <div class="section-container">
+
+    <div class="section-header">
+      <h2 class="section-title">Classify Your Sample</h2>
+      <p class="section-subtitle">Upload a CSV with Ensembl gene IDs as columns and TPM expression values as rows</p>
+    </div>
+
+    <div class="input-grid">
+
+      <!-- Upload Card -->
+      <div class="card input-card">
+        <div class="card-header">
+          <div class="card-icon">📂</div>
+          <div>
+            <h3 class="card-title">Upload Gene Data</h3>
+            <p class="card-desc">CSV with Ensembl IDs as columns, TPM values as rows</p>
+          </div>
+        </div>
+
+        <div class="drop-zone" id="dropZone">
+          <div class="drop-icon">
+            <svg width="48" height="48" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="1.5">
+              <path d="M21 15v4a2 2 0 01-2 2H5a2 2 0 01-2-2v-4M17 8l-5-5-5 5M12 3v12"/>
+            </svg>
+          </div>
+          <p class="drop-text">Drop your CSV here or <span class="drop-link">browse</span></p>
+          <p class="drop-hint">Supports .csv &nbsp;&middot;&nbsp; Max 16 MB</p>
+          <input type="file" id="fileInput" accept=".csv,.tsv" hidden>
+        </div>
+
+        <div class="file-preview" id="filePreview" style="display:none">
+          <div class="file-info">
+            <span class="file-icon">📄</span>
+            <span class="file-name" id="fileName"></span>
+            <button class="file-remove" id="fileRemove" title="Remove file" onclick="clearFile()">&#x2715;</button>
+          </div>
+        </div>
+
+        <button class="btn-primary" id="predictBtn" onclick="uploadAndPredict()">
+          <span>Run Prediction</span>
+          <svg width="16" height="16" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2">
+            <polygon points="5 3 19 12 5 21 5 3"/>
+          </svg>
+        </button>
+      </div>
+
+      <!-- Demo Card -->
+      <div class="card demo-card">
+        <div class="card-header">
+          <div class="card-icon">🧪</div>
+          <div>
+            <h3 class="card-title">Demo Mode</h3>
+            <p class="card-desc">Try pre-loaded TCGA patient samples per subtype</p>
+          </div>
+        </div>
+
+        <div class="demo-status" id="demoStatus">
+          <div class="status-dot loading" id="demoDot"></div>
+          <span id="demoStatusText">Loading demo samples&hellip;</span>
+        </div>
+
+        <div class="demo-grid" id="demoGrid" style="display:none">
+          <!-- populated by JS -->
+        </div>
+
+        <div class="demo-empty" id="demoEmpty" style="display:none">
+          <p>No demo samples found.</p>
+          <button class="btn-secondary" id="generateBtn" onclick="generateDemo()">
+            <span>&#x2699; Generate from TCGA</span>
+          </button>
+          <p class="demo-empty-note">Requires the TCGA-BRCA dataset (~700 MB) inside <code>datasets/</code>.</p>
+        </div>
+      </div>
+
+    </div><!-- /input-grid -->
+
+    <!-- Loading Overlay -->
+    <div class="loading-overlay" id="loadingOverlay" style="display:none">
+      <div class="loading-card">
+        <div class="loading-spinner">
+          <div class="spinner-ring"></div>
+          <div class="spinner-dna">🧬</div>
+        </div>
+        <p class="loading-title">Analysing Gene Expression</p>
+        <p class="loading-step" id="loadingStep">Preparing data&hellip;</p>
+        <div class="loading-bar">
+          <div class="loading-progress" id="loadingProgress"></div>
+        </div>
+      </div>
+    </div>
+
+    <!-- Results Panel -->
+    <div class="results-panel" id="resultsPanel" style="display:none">
+
+      <div class="results-header">
+        <h3 class="results-title">Classification Results</h3>
+        <button class="btn-ghost" onclick="resetAll()">
+          <svg width="14" height="14" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2">
+            <path d="M3 12a9 9 0 109-9M3 12L1 10m2 2l2-2"/>
+          </svg>
+          New Sample
+        </button>
+      </div>
+
+      <div class="results-grid">
+
+        <!-- Confidence Ring + Subtype Badge -->
+        <div class="card result-main-card" id="resultMainCard">
+          <div class="subtype-display">
+            <div class="confidence-ring-wrapper">
+              <svg class="confidence-ring" viewBox="0 0 120 120" id="confidenceRingSvg">
+                <circle class="ring-bg"   cx="60" cy="60" r="50"/>
+                <circle class="ring-fill" cx="60" cy="60" r="50" id="ringFill"/>
+              </svg>
+              <div class="ring-center">
+                <span class="ring-pct"   id="ringPct">0%</span>
+                <span class="ring-label">confidence</span>
+              </div>
+            </div>
+            <div class="subtype-info-main">
+              <div class="subtype-badge"    id="subtypeBadge">&mdash;</div>
+              <div class="subtype-fullname" id="subtypeFullname"></div>
+              <div class="subtype-receptor" id="subtypeReceptor"></div>
+              <div class="rows-processed"   id="rowsProcessed"></div>
+            </div>
+          </div>
+        </div>
+
+        <!-- Probability Bar Chart -->
+        <div class="card prob-card">
+          <h4 class="card-section-title">Subtype Probabilities</h4>
+          <div class="prob-chart" id="probChart">
+            <!-- rendered by JS -->
+          </div>
+        </div>
+
+      </div><!-- /results-grid -->
+
+      <!-- Subtype Detail Card -->
+      <div class="card detail-card" id="detailCard">
+        <div class="detail-grid">
+          <div class="detail-col">
+            <h4 class="detail-heading">
+              <svg width="16" height="16" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2">
+                <circle cx="12" cy="12" r="10"/><path d="M12 8v4l3 3"/>
+              </svg>
+              Prognosis
+            </h4>
+            <p class="detail-text" id="detailPrognosis"></p>
+          </div>
+          <div class="detail-col">
+            <h4 class="detail-heading">
+              <svg width="16" height="16" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2">
+                <path d="M9 3H5a2 2 0 00-2 2v4m6-6h10a2 2 0 012 2v4M9 3v18m0 0h10a2 2 0 002-2V9M9 21H5a2 2 0 01-2-2V9m0 0h18"/>
+              </svg>
+              Key Biomarkers
+            </h4>
+            <div class="biomarker-chips" id="detailBiomarkers"></div>
+          </div>
+          <div class="detail-col detail-col-wide">
+            <h4 class="detail-heading">
+              <svg width="16" height="16" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2">
+                <path d="M19 21l-7-5-7 5V5a2 2 0 012-2h10a2 2 0 012 2z"/>
+              </svg>
+              Recommended Therapy
+            </h4>
+            <ul class="therapy-list" id="detailTherapy"></ul>
+          </div>
+        </div>
+        <div class="detail-description" id="detailDescription"></div>
+      </div>
+
+      <!-- Sample Preview Table -->
+      <div class="card table-card" id="tableCard" style="display:none">
+        <h4 class="card-section-title">
+          Sample Data Preview
+          <span class="table-note">(first 5 rows &middot; 6 genes shown)</span>
+        </h4>
+        <div class="table-wrapper">
+          <table class="preview-table" id="previewTable"></table>
+        </div>
+      </div>
+
+      <!-- Disclaimer -->
+      <div class="disclaimer">
+        <svg width="14" height="14" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2">
+          <path d="M10.29 3.86L1.82 18a2 2 0 001.71 3h16.94a2 2 0 001.71-3L13.71 3.86a2 2 0 00-3.42 0zM12 9v4M12 17h.01"/>
+        </svg>
+        For research purposes only. Not intended for clinical diagnosis or treatment decisions.
+      </div>
+
+    </div><!-- /results-panel -->
+
+  </div><!-- /section-container -->
+</section>
+
+<!-- ── Subtypes Education ── -->
+<section class="subtypes-section" id="subtypes">
+  <div class="section-container">
+    <div class="section-header">
+      <h2 class="section-title">Breast Cancer Molecular Subtypes</h2>
+      <p class="section-subtitle">Gene expression-based classification identifies five clinically distinct subtypes with different prognoses and treatment strategies</p>
+    </div>
+
+    <div class="subtypes-grid">
+      {% for key, info in subtype_info.items() %}
+      <div class="subtype-card reveal-card" style="--accent: {{ info.color }}">
+        <div class="subtype-card-header">
+          <div class="subtype-card-name">{{ key }}</div>
+          <div class="subtype-card-fullname">{{ info.full_name }}</div>
+        </div>
+        <div class="subtype-card-receptor">{{ info.receptor_status }}</div>
+        <p class="subtype-card-desc">{{ info.description }}</p>
+        <div class="subtype-card-footer">
+          <span class="prognosis-tag">{{ info.prognosis.split('—')[0].strip() }}</span>
+        </div>
+      </div>
+      {% endfor %}
+    </div>
+  </div>
+</section>
+
+<!-- ── About ── -->
+<section class="about-section" id="about">
+  <div class="section-container">
+    <div class="about-grid">
+      <div class="about-text">
+        <h2 class="section-title">About the Model</h2>
+        <p>This classifier uses a <strong>Stacking Ensemble</strong> that combines Random Forest, XGBoost, and LightGBM as base learners, with a meta-learner selected via 5-fold stratified cross-validation.</p>
+        <p>Trained on the <strong>TCGA-BRCA cohort</strong> — gene expression data normalised to TPM (Transcripts Per Million). The model expects Ensembl gene IDs as features and outputs class probabilities across all five subtypes.</p>
+        <div class="model-stats">
+          <div class="stat-item">
+            <div class="stat-value">5</div>
+            <div class="stat-label">Subtypes</div>
+          </div>
+          <div class="stat-item">
+            <div class="stat-value">3</div>
+            <div class="stat-label">Base Learners</div>
+          </div>
+          <div class="stat-item">
+            <div class="stat-value">TCGA</div>
+            <div class="stat-label">Training Data</div>
+          </div>
+        </div>
+      </div>
+
+      <div class="about-pipeline">
+        <div class="pipeline-step">
+          <div class="pipeline-num">1</div>
+          <div class="pipeline-text">
+            <strong>Input</strong>
+            <span>Ensembl ID gene expression matrix (TPM format)</span>
+          </div>
+        </div>
+        <div class="pipeline-arrow">&#x2193;</div>
+        <div class="pipeline-step">
+          <div class="pipeline-num">2</div>
+          <div class="pipeline-text">
+            <strong>Base Layer</strong>
+            <span>RF + XGBoost + LightGBM class predictions</span>
+          </div>
+        </div>
+        <div class="pipeline-arrow">&#x2193;</div>
+        <div class="pipeline-step">
+          <div class="pipeline-num">3</div>
+          <div class="pipeline-text">
+            <strong>Meta-Learner</strong>
+            <span>Final stacking classifier over base outputs</span>
+          </div>
+        </div>
+        <div class="pipeline-arrow">&#x2193;</div>
+        <div class="pipeline-step">
+          <div class="pipeline-num">4</div>
+          <div class="pipeline-text">
+            <strong>Output</strong>
+            <span>Subtype + per-class probabilities + therapy</span>
+          </div>
+        </div>
+      </div>
+    </div>
+  </div>
+</section>
+
+<!-- ── Footer ── -->
+<footer class="footer">
+  <div class="footer-content">
+    <div class="footer-brand">
+      <span>🧬</span>
+      <span>BRCA<strong>Classifier</strong></span>
+    </div>
+    <p class="footer-disclaimer">&#9888;&#65039; Research use only &mdash; not a medical device. Results must be interpreted by qualified professionals.</p>
+    <p class="footer-credits">Built with TCGA-BRCA data &middot; Stacking Ensemble &middot; Flask + Vanilla JS</p>
+  </div>
+</footer>
+
+<script src="{{ url_for('static', filename='script.js') }}"></script>
+</body>
+</html>
