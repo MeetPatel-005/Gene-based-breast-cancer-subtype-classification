@@ -124,4 +124,4 @@ To benchmark new classifier topologies:
 ---
 
 ## 🤝 Contributions
-Pull requests, issues, and exploratory forks are highly welcomed. Let's conquer breast cancer informatics together!
+Pull requests, issues, and exploratory forks are highly welcomed.
