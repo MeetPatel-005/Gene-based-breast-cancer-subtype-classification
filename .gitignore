@@ -68,7 +68,6 @@ brca_webapp/models
 brca_webapp/uploads
 .agents
 Webapp idea.md
-
 system_architecture.png
 system_model.png
 web_app_architecture.png
