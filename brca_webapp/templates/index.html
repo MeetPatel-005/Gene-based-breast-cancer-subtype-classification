@@ -234,6 +234,71 @@
         <div class="detail-description" id="detailDescription"></div>
       </div>
 
+      <!-- Top Gene Drivers Card -->
+      <div class="card gene-drivers-card" id="geneDriversCard" style="display:none">
+        <div class="gene-drivers-header">
+          <h4 class="card-section-title">
+            <svg width="16" height="16" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2">
+              <path d="M12 2v20M2 12h20M4.93 4.93l14.14 14.14M19.07 4.93L4.93 19.07"/>
+            </svg>
+            Top Gene Drivers
+            <span class="gene-drivers-count" id="geneDriversCount">10 genes</span>
+          </h4>
+          <p class="gene-drivers-subhead">Genes with the highest contribution to this patient's subtype classification</p>
+        </div>
+
+        <!-- Gene bar chart -->
+        <div class="gene-drivers-list" id="geneDriversList">
+          <!-- populated by JS -->
+        </div>
+
+        <!-- LLM gene summary -->
+        <div class="gene-drivers-summary" id="geneDriversSummary" style="display:none"></div>
+
+        <div class="gene-drivers-footer">
+          Importance scores derived from model feature analysis (RF · XGBoost · LightGBM) &middot; Gene names via mygene
+        </div>
+      </div>
+
+      <div class="card evidence-card" id="evidenceCard" style="display:none">
+        <div class="evidence-header">
+          <h4 class="card-section-title">
+            <svg width="16" height="16" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2">
+              <path d="M12 2L2 7l10 5 10-5-10-5zM2 17l10 5 10-5M2 12l10 5 10-5"/>
+            </svg>
+            Treatment Evidence
+            <span class="evidence-live-badge" id="evidenceLiveBadge">● Live</span>
+          </h4>
+          <p class="evidence-subhead">Response probabilities grounded in PubMed clinical trials</p>
+        </div>
+
+        <!-- Amber warning if internet fetch failed -->
+        <div class="evidence-warning-banner" id="evidenceWarning" style="display:none">
+          <svg width="14" height="14" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2">
+            <path d="M10.29 3.86L1.82 18a2 2 0 001.71 3h16.94a2 2 0 001.71-3L13.71 3.86a2 2 0 00-3.42 0zM12 9v4M12 17h.01"/>
+          </svg>
+          <span id="evidenceWarningText"></span>
+        </div>
+
+        <!-- Therapy probability bars -->
+        <div class="evidence-therapy-list" id="evidenceTherapyList">
+          <!-- populated by JS -->
+        </div>
+
+        <!-- Clinical rationale -->
+        <div class="evidence-rationale" id="evidenceRationale" style="display:none"></div>
+
+        <!-- Source citations -->
+        <div class="evidence-sources-section" id="evidenceSourcesSection" style="display:none">
+          <div class="evidence-sources-title">Evidence Sources</div>
+          <div class="evidence-source-chips" id="evidenceSourceChips"></div>
+        </div>
+
+        <div class="evidence-footer-note">
+          Data sourced from PubMed &amp; ClinicalTrials.gov &middot; For research use only
+        </div>
+      </div>
+
       <!-- Sample Preview Table -->
       <div class="card table-card" id="tableCard" style="display:none">
         <h4 class="card-section-title">
@@ -356,6 +421,51 @@
     <p class="footer-credits">Built with TCGA-BRCA data &middot; Stacking Ensemble &middot; Flask + Vanilla JS</p>
   </div>
 </footer>
+
+
+<!-- ── Clinical AI Chat Widget ── -->
+<div id="chatBubble" class="chat-bubble" onclick="chatWidget.toggle()" title="Ask your AI assistant">
+  <svg id="chatBubbleIcon" width="26" height="26" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2">
+    <path d="M21 15a2 2 0 01-2 2H7l-4 4V5a2 2 0 012-2h14a2 2 0 012 2z"/>
+  </svg>
+  <span id="chatUnread" class="chat-unread" style="display:none">1</span>
+</div>
+
+<div id="chatPanel" class="chat-panel" style="display:none">
+  <div class="chat-header">
+    <div class="chat-header-info">
+      <div class="chat-avatar">🧬</div>
+      <div>
+        <div class="chat-header-name">Clinical AI Assistant</div>
+        <div class="chat-header-status" id="chatStatus">Ask me anything about your results</div>
+      </div>
+    </div>
+    <button class="chat-close" onclick="chatWidget.toggle()" title="Close chat">&times;</button>
+  </div>
+
+  <div class="chat-messages" id="chatMessages">
+    <div class="chat-msg bot">
+      <div class="chat-bubble-msg">👋 Hello! I'm your clinical AI assistant. Run a sample prediction above, then ask me anything about your diagnosis, treatment options, or breast cancer subtypes.</div>
+    </div>
+  </div>
+
+  <div class="chat-input-row">
+    <input
+      id="chatInput"
+      class="chat-input"
+      type="text"
+      placeholder="Ask about your diagnosis…"
+      maxlength="400"
+      onkeydown="if(event.key==='Enter') chatWidget.send()"
+    />
+    <button class="chat-send" id="chatSendBtn" onclick="chatWidget.send()">
+      <svg width="18" height="18" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2">
+        <line x1="22" y1="2" x2="11" y2="13"/>
+        <polygon points="22 2 15 22 11 13 2 9 22 2"/>
+      </svg>
+    </button>
+  </div>
+</div>
 
 <script src="{{ url_for('static', filename='script.js') }}"></script>
 </body>

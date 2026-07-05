@@ -2,8 +2,9 @@ import pickle
 import sys
 from pathlib import Path
 
+import numpy as np
 import pandas as pd
-from flask import Flask, jsonify, render_template, request
+from flask import Flask, Response, jsonify, render_template, request
 
 BASE_DIR = Path(__file__).resolve().parent
 PROJECT_ROOT = BASE_DIR.parent
@@ -13,11 +14,16 @@ DATASET_PATH = PROJECT_ROOT / "datasets" / "TCGA_BRCA_tpm.tsv"
 CLINICAL_PATH = PROJECT_ROOT / "datasets" / "brca_tcga_pan_can_atlas_2018_clinical_data_filtered.tsv"
 
 sys.path.insert(0, str(PROJECT_ROOT))
+sys.path.insert(0, str(BASE_DIR))  # exposes brca_webapp/ local modules
 
 # Import the wrapper class before unpickling the model.
 from src.train_stacking_improved import _LEWrapper  # noqa: F401
+from enhanced_agent import EnhancedClinicalAgent
+from kegg_service import get_gene_pathways, get_pathway_image
 
 app = Flask(__name__)
+
+agent = EnhancedClinicalAgent()
 app.config["MAX_CONTENT_LENGTH"] = 16 * 1024 * 1024
 
 with MODEL_PATH.open("rb") as f:
@@ -119,6 +125,123 @@ SUBTYPE_INFO = {
 
 
 # ---------------------------------------------------------------------------
+# Gene name resolver (mygene, cached)
+# ---------------------------------------------------------------------------
+_gene_name_cache: dict[str, dict] = {}  # ensembl_id → {symbol, name}
+
+def _resolve_gene_names(ensembl_ids: list[str]) -> dict[str, dict]:
+    """Batch-resolve Ensembl IDs → {symbol, name} via mygene. Results are cached."""
+    missing = [eid for eid in ensembl_ids if eid not in _gene_name_cache]
+    if missing:
+        try:
+            import mygene
+            mg = mygene.MyGeneInfo()
+            results = mg.querymany(
+                missing, scopes="ensembl.gene",
+                fields="symbol,name", species="human", verbose=False,
+            )
+            for hit in results:
+                eid = hit.get("query", "")
+                _gene_name_cache[eid] = {
+                    "symbol": hit.get("symbol", eid),
+                    "name":   hit.get("name", ""),
+                }
+        except Exception:  # noqa: BLE001
+            # Fallback: use raw Ensembl IDs if mygene unavailable
+            for eid in missing:
+                _gene_name_cache[eid] = {"symbol": eid, "name": ""}
+    return {eid: _gene_name_cache.get(eid, {"symbol": eid, "name": ""}) for eid in ensembl_ids}
+
+
+# ---------------------------------------------------------------------------
+# Top gene driver computation
+# ---------------------------------------------------------------------------
+
+def compute_top_gene_drivers(
+    stacking_model, prepared_df: pd.DataFrame, n_top: int = 10,
+) -> list[dict]:
+    """Extract per-sample top gene drivers using base-learner feature importances.
+
+    Steps:
+      1. Average feature_importances_ across RF, XGBoost, LightGBM.
+      2. Multiply by each sample's normalised expression (z-score) to get
+         per-sample contribution scores.
+      3. Return top-N genes sorted by absolute contribution for the first sample.
+    """
+    feature_names = list(getattr(stacking_model, "feature_names_in_", []))
+    if not feature_names:
+        return []
+
+    # ── Collect base-learner importances ───────────────────────────────────
+    importances = []
+    for est in stacking_model.estimators_:
+        if hasattr(est, "feature_importances_"):
+            importances.append(est.feature_importances_)
+        elif hasattr(est, "estimator") and hasattr(est.estimator, "feature_importances_"):
+            importances.append(est.estimator.feature_importances_)
+
+    if not importances:
+        return []
+
+    # Average across base learners and normalise to [0, 1]
+    global_imp = np.mean(importances, axis=0)
+    imp_max = global_imp.max()
+    if imp_max > 0:
+        global_imp_norm = global_imp / imp_max
+    else:
+        return []
+
+    # ── Per-sample weighted importance (first sample) ─────────────────────
+    sample = prepared_df.iloc[0].values.astype(float)
+    # Z-score normalise expression values
+    mean_val = np.nanmean(sample)
+    std_val  = np.nanstd(sample)
+    if std_val > 0:
+        z_scores = (sample - mean_val) / std_val
+    else:
+        z_scores = sample - mean_val
+
+    # Contribution = global_importance × |z-score of expression|
+    contributions = global_imp_norm * np.abs(z_scores)
+
+    # Top N indices by contribution
+    top_indices = np.argsort(contributions)[::-1][:n_top]
+
+    # ── Resolve gene names ────────────────────────────────────────────────
+    # Strip version suffixes (.2, .15) for mygene lookup
+    top_ensembl_raw = [feature_names[i] for i in top_indices]
+    top_ensembl_clean = [eid.split(".")[0] for eid in top_ensembl_raw]
+    gene_info = _resolve_gene_names(top_ensembl_clean)
+
+    # ── Build result list ─────────────────────────────────────────────────
+    drivers = []
+    max_contribution = contributions[top_indices[0]] if len(top_indices) > 0 else 1.0
+    for rank, idx in enumerate(top_indices, 1):
+        eid_raw   = feature_names[idx]
+        eid_clean = eid_raw.split(".")[0]
+        info      = gene_info.get(eid_clean, {})
+        expr_val  = float(sample[idx])
+
+        drivers.append({
+            "rank":             rank,
+            "ensembl_id":       eid_raw,
+            "gene_symbol":      info.get("symbol", eid_clean),
+            "gene_name":        info.get("name", ""),
+            "importance_score":  float(contributions[idx]),
+            "importance_pct":   float(contributions[idx] / max_contribution) if max_contribution > 0 else 0.0,
+            "global_importance": float(global_imp_norm[idx]),
+            "expression_value":  round(expr_val, 2),
+            "expression_level":  (
+                "High" if z_scores[idx] > 1.5 else
+                "Low"  if z_scores[idx] < -1.5 else
+                "Normal"
+            ),
+        })
+
+    return drivers
+
+
+# ---------------------------------------------------------------------------
 # Helpers
 # ---------------------------------------------------------------------------
 
@@ -171,15 +294,21 @@ def build_prediction_response(prepared_df: pd.DataFrame, original_df: pd.DataFra
         original_df[preview_cols].head(5).fillna(0).round(4).to_dict(orient="records")
     )
 
+    # ── Top gene drivers (per-sample feature importance) ──────────────────
+    top_gene_drivers = compute_top_gene_drivers(model, prepared_df, n_top=10)
+
     return {
         "samples": samples,
         "subtype": predictions[0],
         "confidence": float(probabilities[0].max()),
         "probabilities": {cls: float(probabilities[0][j]) for j, cls in enumerate(classes)},
+        "detected_biomarkers": SUBTYPE_INFO.get(predictions[0], {}).get("biomarkers", []),
         "classes": classes,
         "rows_processed": int(len(prepared_df)),
         "preview": preview_data,
         "preview_cols": preview_cols,
+        "top_gene_drivers": top_gene_drivers,
+        "evidence_warning": None,   # filled in by agent layer
     }
 
 
@@ -207,7 +336,13 @@ def predict():
     try:
         df = pd.read_csv(file)
         prepared_df = prepare_input_frame(df)
-        return jsonify(build_prediction_response(prepared_df, df))
+        response = build_prediction_response(prepared_df, df)
+        
+        # Run agentic layer and merge into response (preserves model output fields)
+        agent_result = agent.run_full_agent(response)
+        response["agent_analysis"]  = agent_result
+        response["evidence_warning"] = agent_result.get("evidence_warning")
+        return jsonify(response)
     except Exception as exc:  # noqa: BLE001
         return jsonify({"error": str(exc)}), 500
 
@@ -221,7 +356,12 @@ def demo(name):
     try:
         df = pd.read_csv(demo_path)
         prepared_df = prepare_input_frame(df)
-        return jsonify(build_prediction_response(prepared_df, df))
+        response = build_prediction_response(prepared_df, df)
+        # Run agentic layer for demo too
+        agent_result = agent.run_full_agent(response)
+        response["agent_analysis"]  = agent_result
+        response["evidence_warning"] = agent_result.get("evidence_warning")
+        return jsonify(response)
     except Exception as exc:  # noqa: BLE001
         return jsonify({"error": str(exc)}), 500
 
@@ -271,6 +411,55 @@ def generate_demo():
 def demo_list():
     files = sorted(p.stem for p in EXAMPLES_DIR.glob("*.csv"))
     return jsonify({"files": files})
+
+
+@app.route("/api/chat", methods=["POST"])
+def api_chat():
+    body = request.get_json(force=True)
+    message = (body.get("message") or "").strip()
+    if not message:
+        return jsonify({"error": "Empty message."}), 400
+    try:
+        reply = agent.chat(
+            message=message,
+            history=body.get("history", []),
+            context=body.get("context"),
+        )
+        return jsonify({"reply": reply})
+    except Exception as exc:  # noqa: BLE001
+        return jsonify({"error": str(exc)}), 500
+
+
+# ---------------------------------------------------------------------------
+# KEGG Pathway API
+# ---------------------------------------------------------------------------
+
+@app.route("/api/kegg/pathways/<gene_symbol>")
+def api_kegg_pathways(gene_symbol: str):
+    """Return KEGG pathway list for a gene symbol."""
+    try:
+        pathways = get_gene_pathways(gene_symbol)
+        if pathways:
+            return jsonify({"gene": gene_symbol, "pathways": pathways})
+        return jsonify({
+            "gene": gene_symbol,
+            "pathways": [],
+            "message": f"No KEGG pathways found for {gene_symbol}",
+        })
+    except Exception as exc:  # noqa: BLE001
+        return jsonify({"error": str(exc)}), 500
+
+
+@app.route("/api/kegg/pathway-image/<pathway_id>")
+def api_kegg_pathway_image(pathway_id: str):
+    """Proxy a KEGG pathway PNG image to avoid CORS issues."""
+    try:
+        img_bytes = get_pathway_image(pathway_id)
+        if img_bytes:
+            return Response(img_bytes, mimetype="image/png")
+        return jsonify({"error": "Pathway image not found"}), 404
+    except Exception as exc:  # noqa: BLE001
+        return jsonify({"error": str(exc)}), 500
 
 
 if __name__ == "__main__":

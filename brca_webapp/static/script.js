@@ -150,6 +150,7 @@ const LOADING_STEPS = [
   'Preparing data…',
   'Running base learners…',
   'Computing meta-predictions…',
+  'Fetching clinical evidence…',
   'Building output…',
 ];
 
@@ -182,6 +183,9 @@ function renderResults(data) {
   const meta    = SUBTYPE_META[subtype] || {};
   const color   = meta.color || '#7c6af7';
 
+  // Store context for chat widget
+  window._lastPrediction = data;
+
   // 2. Confidence ring
   renderConfidenceRing(data.confidence, color);
   $('ringPct').textContent = pct + '%';
@@ -205,7 +209,13 @@ function renderResults(data) {
   // 5. Detail card
   renderDetailCard(subtype, meta, color);
 
-  // 6. Sample preview table
+  // 5.5 Top Gene Drivers panel
+  renderTopGeneDrivers(data, color);
+
+  // 6. Treatment Evidence panel
+  renderEvidencePanel(data);
+
+  // 7. Sample preview table
   if (data.preview && data.preview.length > 0) {
     renderPreviewTable(data.preview, data.preview_cols);
     $('tableCard').style.display = 'block';
@@ -296,6 +306,422 @@ function renderDetailCard(subtype, meta, color) {
   });
 
   $('detailDescription').textContent = meta.description || '';
+}
+
+// ── Treatment Evidence Panel ──────────────────────────────────────────────
+function renderEvidencePanel(data) {
+  const card = $('evidenceCard');
+  const agent = data.agent_analysis || {};
+  const routes = agent.therapy_routes || {};
+  const warning = data.evidence_warning || agent.evidence_warning || null;
+
+  // Nothing useful to show — hide panel
+  if (!routes.primary_therapy && !warning) {
+    card.style.display = 'none';
+    return;
+  }
+  card.style.display = 'block';
+
+  // ─ Live / offline badge ──────────────────────────────────────────
+  const liveBadge = $('evidenceLiveBadge');
+  if (warning) {
+    liveBadge.textContent = '● Offline';
+    liveBadge.className   = 'evidence-live-badge offline';
+    $('evidenceWarningText').textContent = warning;
+    $('evidenceWarning').style.display   = 'flex';
+  } else {
+    liveBadge.textContent = '● Live';
+    liveBadge.className   = 'evidence-live-badge';
+    $('evidenceWarning').style.display = 'none';
+  }
+
+  // ─ Build therapy list (primary + alternatives) ──────────────────────
+  const listEl = $('evidenceTherapyList');
+  listEl.innerHTML = '';
+
+  const allTherapies = [];
+  if (routes.primary_therapy) {
+    allTherapies.push({ ...routes.primary_therapy, _isPrimary: true });
+  }
+  (routes.alternatives || []).forEach(t => allTherapies.push({ ...t, _isPrimary: false }));
+
+  allTherapies.forEach(therapy => {
+    const prob = therapy.probability_of_response;   // 0-1 or null
+    const pct  = prob != null ? Math.round(prob * 100) : null;
+    const surv = therapy['5yr_survival_rate'];
+    const isPrimary = therapy._isPrimary;
+    const barColor  = isPrimary
+      ? 'linear-gradient(90deg, #7c6af7, #b06ef7)'
+      : 'rgba(124,106,247,0.38)';
+
+    const row = document.createElement('div');
+    row.className = 'evidence-therapy-row';
+    row.innerHTML = `
+      <div class="evidence-therapy-header">
+        <span class="evidence-therapy-name${isPrimary ? ' primary' : ''}">
+          ${isPrimary ? '★ ' : ''}<span>${therapy.name || 'Unnamed therapy'}</span>
+        </span>
+        <div style="display:flex;align-items:center;gap:0.5rem">
+          ${surv != null ? `<span class="evidence-therapy-surv">${Math.round(surv*100)}% 5yr</span>` : ''}
+          ${pct  != null ? `<span class="evidence-therapy-pct">${pct}%</span>` : '<span class="evidence-therapy-pct muted">N/A</span>'}
+          <span class="evidence-therapy-badge ${isPrimary ? 'primary' : 'alternative'}">
+            ${isPrimary ? 'Recommended' : 'Alternative'}
+          </span>
+        </div>
+      </div>
+      ${therapy.evidence_basis ? `<div class="evidence-basis">${therapy.evidence_basis}</div>` : ''}
+      <div class="evidence-therapy-track">
+        <div class="evidence-therapy-fill"
+             data-pct="${prob ?? 0}"
+             style="background:${barColor};width:0%"></div>
+      </div>
+    `;
+    listEl.appendChild(row);
+  });
+
+  // Animate bars
+  requestAnimationFrame(() => requestAnimationFrame(() => {
+    listEl.querySelectorAll('.evidence-therapy-fill').forEach(el => {
+      el.style.width = (parseFloat(el.dataset.pct) * 100) + '%';
+    });
+  }));
+
+  // ─ Rationale ───────────────────────────────────────────────────────────
+  const rationaleEl = $('evidenceRationale');
+  if (routes.rationale) {
+    rationaleEl.textContent    = routes.rationale;
+    rationaleEl.style.display  = 'block';
+  } else {
+    rationaleEl.style.display  = 'none';
+  }
+
+  // ─ Source chips ─────────────────────────────────────────────────────
+  const sources = agent.evidence_sources || routes.evidence_sources || [];
+  const chipsEl = $('evidenceSourceChips');
+  chipsEl.innerHTML = '';
+
+  if (sources.length) {
+    sources.forEach(src => {
+      const a = document.createElement('a');
+      a.className = 'evidence-source-chip';
+      // PubMed-searchable link
+      a.href   = `https://pubmed.ncbi.nlm.nih.gov/?term=${encodeURIComponent(src)}`;
+      a.target = '_blank';
+      a.rel    = 'noopener noreferrer';
+      a.innerHTML = `🔗 ${src}`;
+      chipsEl.appendChild(a);
+    });
+    $('evidenceSourcesSection').style.display = 'block';
+  } else {
+    $('evidenceSourcesSection').style.display = 'none';
+  }
+}
+
+// ── KEGG Pathway Viewer Module ───────────────────────────────────────────
+const keggPathway = (() => {
+  // Client-side cache: gene_symbol → {pathways: [...], fetched: true} or null
+  const _cache = {};
+
+  /**
+   * Toggle the KEGG pathway dropdown for a gene row.
+   */
+  async function toggle(geneSymbol, dropdownEl, toggleBtn) {
+    const isOpen = dropdownEl.classList.contains('open');
+
+    if (isOpen) {
+      dropdownEl.classList.remove('open');
+      toggleBtn.classList.remove('active');
+      return;
+    }
+
+    toggleBtn.classList.add('active');
+    dropdownEl.classList.add('open');
+
+    // Already loaded?
+    if (_cache[geneSymbol]) {
+      return;
+    }
+
+    // Show loading state
+    dropdownEl.innerHTML = `
+      <div class="kegg-pathway-loading">
+        <div class="kegg-pathway-spinner"></div>
+        <span>Searching KEGG for ${geneSymbol} pathways…</span>
+      </div>
+    `;
+
+    try {
+      const resp = await fetch(`/api/kegg/pathways/${encodeURIComponent(geneSymbol)}`);
+      const data = await resp.json();
+
+      if (data.error) {
+        _renderError(dropdownEl, data.error);
+        _cache[geneSymbol] = { pathways: [], fetched: true };
+        return;
+      }
+
+      const pathways = data.pathways || [];
+      _cache[geneSymbol] = { pathways, fetched: true };
+
+      if (pathways.length === 0) {
+        _renderEmpty(dropdownEl, geneSymbol);
+      } else {
+        _renderPathwaySelector(dropdownEl, geneSymbol, pathways);
+      }
+    } catch (err) {
+      _renderError(dropdownEl, 'Network error: ' + err.message);
+      _cache[geneSymbol] = { pathways: [], fetched: true };
+    }
+  }
+
+  /**
+   * Render the "no pathways found" message.
+   */
+  function _renderEmpty(container, geneSymbol) {
+    container.innerHTML = `
+      <div class="kegg-pathway-empty">
+        <svg width="16" height="16" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2">
+          <circle cx="12" cy="12" r="10"/>
+          <line x1="15" y1="9" x2="9" y2="15"/>
+          <line x1="9" y1="9" x2="15" y2="15"/>
+        </svg>
+        <span>No KEGG pathway found for <strong>${geneSymbol}</strong>. This gene may not have mapped pathways in the KEGG database.</span>
+      </div>
+    `;
+  }
+
+  /**
+   * Render the error state.
+   */
+  function _renderError(container, message) {
+    container.innerHTML = `
+      <div class="kegg-pathway-error">
+        <svg width="16" height="16" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2">
+          <path d="M10.29 3.86L1.82 18a2 2 0 001.71 3h16.94a2 2 0 001.71-3L13.71 3.86a2 2 0 00-3.42 0zM12 9v4M12 17h.01"/>
+        </svg>
+        <span>${message}</span>
+      </div>
+    `;
+  }
+
+  /**
+   * Render the pathway selector dropdown + image viewer.
+   */
+  function _renderPathwaySelector(container, geneSymbol, pathways) {
+    // Build options HTML
+    const optionsHtml = pathways.map((p, i) =>
+      `<option value="${p.pathway_id}"${i === 0 ? ' selected' : ''}>${p.name} (${p.pathway_id})</option>`
+    ).join('');
+
+    container.innerHTML = `
+      <div class="kegg-pathway-select-wrap">
+        <label class="kegg-pathway-select-label">Select Pathway (${pathways.length} found)</label>
+        <select class="kegg-pathway-select" id="keggSelect_${geneSymbol}">
+          ${optionsHtml}
+        </select>
+      </div>
+      <div class="kegg-pathway-viewer" id="keggViewer_${geneSymbol}">
+        <div class="kegg-img-loading">
+          <div class="kegg-pathway-spinner"></div>
+          <span>Loading pathway image…</span>
+        </div>
+      </div>
+    `;
+
+    const selectEl = container.querySelector('.kegg-pathway-select');
+    const viewerEl = container.querySelector('.kegg-pathway-viewer');
+
+    // Load the first pathway image immediately
+    _loadPathwayImage(viewerEl, pathways[0].pathway_id, pathways[0].name);
+
+    // Listen for changes
+    selectEl.addEventListener('change', () => {
+      const selectedId = selectEl.value;
+      const selectedPathway = pathways.find(p => p.pathway_id === selectedId);
+      const name = selectedPathway ? selectedPathway.name : selectedId;
+      _loadPathwayImage(viewerEl, selectedId, name);
+    });
+  }
+
+  /**
+   * Load and display a pathway image with zoom controls.
+   */
+  function _loadPathwayImage(viewerEl, pathwayId, pathwayName) {
+    viewerEl.innerHTML = `
+      <div class="kegg-img-loading">
+        <div class="kegg-pathway-spinner"></div>
+        <span>Loading pathway image…</span>
+      </div>
+    `;
+
+    const img = new Image();
+    img.className = 'kegg-pathway-image';
+    img.alt = `KEGG Pathway: ${pathwayName}`;
+
+    img.onload = () => {
+      let zoom = 100;
+      const ZOOM_STEP = 20;
+      const MIN_ZOOM = 40;
+      const MAX_ZOOM = 200;
+
+      viewerEl.innerHTML = '';
+
+      // Image container (scrollable)
+      const imgContainer = document.createElement('div');
+      imgContainer.className = 'kegg-pathway-img-container';
+      imgContainer.appendChild(img);
+
+      // Controls bar
+      const controls = document.createElement('div');
+      controls.className = 'kegg-pathway-controls';
+      controls.innerHTML = `
+        <span class="kegg-pathway-name" title="${pathwayName}">${pathwayName}</span>
+        <div class="kegg-zoom-controls">
+          <button class="kegg-zoom-btn" data-action="out" title="Zoom out">−</button>
+          <span class="kegg-zoom-level">${zoom}%</span>
+          <button class="kegg-zoom-btn" data-action="in" title="Zoom in">+</button>
+          <button class="kegg-zoom-btn" data-action="fit" title="Fit to width">⤢</button>
+        </div>
+      `;
+
+      viewerEl.appendChild(imgContainer);
+      viewerEl.appendChild(controls);
+
+      const zoomLabel = controls.querySelector('.kegg-zoom-level');
+
+      function applyZoom(newZoom) {
+        zoom = Math.max(MIN_ZOOM, Math.min(MAX_ZOOM, newZoom));
+        img.style.transform = `scale(${zoom / 100})`;
+        zoomLabel.textContent = `${zoom}%`;
+      }
+
+      controls.addEventListener('click', e => {
+        const btn = e.target.closest('.kegg-zoom-btn');
+        if (!btn) return;
+        const action = btn.dataset.action;
+        if (action === 'in')  applyZoom(zoom + ZOOM_STEP);
+        if (action === 'out') applyZoom(zoom - ZOOM_STEP);
+        if (action === 'fit') {
+          const containerW = imgContainer.clientWidth - 16; // minus padding
+          const imgW = img.naturalWidth;
+          if (imgW > 0) {
+            applyZoom(Math.round((containerW / imgW) * 100));
+          }
+        }
+      });
+
+      // Auto-fit if image is wider than container
+      requestAnimationFrame(() => {
+        const containerW = imgContainer.clientWidth - 16;
+        if (img.naturalWidth > containerW) {
+          applyZoom(Math.round((containerW / img.naturalWidth) * 100));
+        }
+      });
+    };
+
+    img.onerror = () => {
+      viewerEl.innerHTML = `
+        <div class="kegg-pathway-error">
+          <svg width="16" height="16" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2">
+            <path d="M10.29 3.86L1.82 18a2 2 0 001.71 3h16.94a2 2 0 001.71-3L13.71 3.86a2 2 0 00-3.42 0zM12 9v4M12 17h.01"/>
+          </svg>
+          <span>Failed to load pathway image for ${pathwayId}</span>
+        </div>
+      `;
+    };
+
+    // Use our proxy endpoint to avoid CORS
+    img.src = `/api/kegg/pathway-image/${encodeURIComponent(pathwayId)}`;
+  }
+
+  return { toggle };
+})();
+
+
+// ── Top Gene Drivers Panel ───────────────────────────────────────────────
+function renderTopGeneDrivers(data, accentColor) {
+  const card = $('geneDriversCard');
+  const drivers = data.top_gene_drivers || [];
+  const geneAnalysis = (data.agent_analysis || {}).gene_analysis || {};
+  const annotations = geneAnalysis.gene_annotations || {};
+  const summary = geneAnalysis.summary || '';
+
+  if (drivers.length === 0) {
+    card.style.display = 'none';
+    return;
+  }
+  card.style.display = 'block';
+
+  $('geneDriversCount').textContent = `${drivers.length} gene${drivers.length !== 1 ? 's' : ''}`;
+
+  const listEl = $('geneDriversList');
+  listEl.innerHTML = '';
+
+  drivers.forEach((gene, idx) => {
+    const pct = Math.round(gene.importance_pct * 100);
+    const exprClass = gene.expression_level === 'High' ? 'high'
+                    : gene.expression_level === 'Low'  ? 'low'
+                    : 'normal';
+    const annotation = annotations[gene.gene_symbol] || '';
+    const delay = idx * 40;
+
+    const row = document.createElement('div');
+    row.className = 'gene-driver-row';
+    row.style.animationDelay = `${delay}ms`;
+    row.innerHTML = `
+      <div class="gene-driver-rank">#${gene.rank}</div>
+      <div class="gene-driver-info">
+        <div class="gene-driver-top">
+          <span class="gene-driver-symbol">${gene.gene_symbol}</span>
+          <span class="gene-driver-name">${gene.gene_name || gene.ensembl_id}</span>
+          <button class="kegg-pathway-toggle" data-gene="${gene.gene_symbol}" title="View KEGG pathways for ${gene.gene_symbol}">
+            <svg width="10" height="10" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2.5">
+              <polyline points="6 9 12 15 18 9"/>
+            </svg>
+            KEGG Pathways
+          </button>
+        </div>
+        <div class="gene-driver-bar-track">
+          <div class="gene-driver-bar-fill"
+               data-pct="${gene.importance_pct}"
+               style="background: linear-gradient(90deg, ${accentColor}, ${accentColor}99); width: 0%"></div>
+        </div>
+        ${annotation ? `<div class="gene-driver-annotation">${annotation}</div>` : ''}
+      </div>
+      <div class="gene-driver-meta">
+        <span class="gene-importance-chip">${pct}%</span>
+        <span class="gene-expression-badge ${exprClass}">${gene.expression_level}</span>
+        <span class="gene-expression-value">${gene.expression_value} TPM</span>
+      </div>
+      <div class="kegg-pathway-dropdown" id="keggDropdown_${gene.gene_symbol}"></div>
+    `;
+
+    // Wire up the toggle button
+    const toggleBtn = row.querySelector('.kegg-pathway-toggle');
+    const dropdownEl = row.querySelector('.kegg-pathway-dropdown');
+    toggleBtn.addEventListener('click', (e) => {
+      e.stopPropagation();
+      keggPathway.toggle(gene.gene_symbol, dropdownEl, toggleBtn);
+    });
+
+    listEl.appendChild(row);
+  });
+
+  // Animate bars
+  requestAnimationFrame(() => requestAnimationFrame(() => {
+    listEl.querySelectorAll('.gene-driver-bar-fill').forEach(el => {
+      el.style.width = (parseFloat(el.dataset.pct) * 100) + '%';
+    });
+  }));
+
+  // LLM summary
+  const summaryEl = $('geneDriversSummary');
+  if (summary) {
+    summaryEl.textContent = summary;
+    summaryEl.style.display = 'block';
+  } else {
+    summaryEl.style.display = 'none';
+  }
 }
 
 // ── Preview Table ────────────────────────────────────────────────────────────
@@ -515,6 +941,105 @@ function initNavLinks() {
     });
   });
 }
+
+// ── Chat Widget ─────────────────────────────────────────────────────────────
+const chatWidget = (() => {
+  let open    = false;
+  let busy    = false;
+  let history = [];
+
+  function toggle() {
+    open = !open;
+    const panel = $('chatPanel');
+    const bubble = $('chatBubble');
+    if (open) {
+      panel.style.display = 'flex';
+      requestAnimationFrame(() => panel.classList.add('open'));
+      $('chatUnread').style.display = 'none';
+      bubble.classList.add('active');
+      $('chatInput').focus();
+    } else {
+      panel.classList.remove('open');
+      setTimeout(() => { panel.style.display = 'none'; }, 320);
+      bubble.classList.remove('active');
+    }
+  }
+
+  function appendMsg(text, role) {
+    const wrap = document.createElement('div');
+    wrap.className = `chat-msg ${role}`;
+    const bubble = document.createElement('div');
+    bubble.className = 'chat-bubble-msg';
+    bubble.textContent = text;
+    wrap.appendChild(bubble);
+    $('chatMessages').appendChild(wrap);
+    $('chatMessages').scrollTop = $('chatMessages').scrollHeight;
+    return bubble;
+  }
+
+  function showTyping() {
+    const wrap = document.createElement('div');
+    wrap.className = 'chat-msg bot';
+    wrap.id = 'chatTyping';
+    wrap.innerHTML = `<div class="chat-bubble-msg chat-typing">
+      <span></span><span></span><span></span>
+    </div>`;
+    $('chatMessages').appendChild(wrap);
+    $('chatMessages').scrollTop = $('chatMessages').scrollHeight;
+  }
+
+  function hideTyping() {
+    const el = $('chatTyping');
+    if (el) el.remove();
+  }
+
+  async function send() {
+    if (busy) return;
+    const input = $('chatInput');
+    const message = input.value.trim();
+    if (!message) return;
+
+    input.value = '';
+    appendMsg(message, 'user');
+
+    busy = true;
+    $('chatSendBtn').disabled = true;
+    $('chatStatus').textContent = 'Thinking…';
+    showTyping();
+
+    try {
+      const resp = await fetch('/api/chat', {
+        method: 'POST',
+        headers: { 'Content-Type': 'application/json' },
+        body: JSON.stringify({
+          message,
+          history,
+          context: window._lastPrediction || null,
+        }),
+      });
+      const data = await resp.json();
+      hideTyping();
+
+      if (data.error) {
+        appendMsg('⚠️ ' + data.error, 'bot');
+      } else {
+        appendMsg(data.reply, 'bot');
+        history.push({ user: message, bot: data.reply });
+      }
+    } catch (err) {
+      hideTyping();
+      appendMsg('⚠️ Network error: ' + err.message, 'bot');
+    } finally {
+      busy = false;
+      $('chatSendBtn').disabled = false;
+      $('chatStatus').textContent = window._lastPrediction
+        ? `Context: ${window._lastPrediction.subtype} patient`
+        : 'Ask me anything about your results';
+    }
+  }
+
+  return { toggle, send };
+})();
 
 // ── Init ─────────────────────────────────────────────────────────────────────
 let dropZone;
